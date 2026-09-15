@@ -50,6 +50,7 @@ def test_openapi_contains_p0_paths():
     surface = spec["paths"]["/api/v1/spatial/surface/{task_id}"]["get"]
     # 响应模型含 tile_crs（在 schema 组件里）
     assert "tile_crs" in spec["components"]["schemas"]["SurfaceLayerInfo"]["properties"]
+    assert "/ws/models/tasks/{task_id}" in paths
 
 
 def test_docs_up():

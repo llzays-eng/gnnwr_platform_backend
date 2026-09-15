@@ -10,6 +10,8 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
+from fastapi.openapi.utils import get_openapi
+
 from app.api.v1 import api_router
 from app.core.config import settings
 from app.ws.progress import router as ws_router
@@ -66,6 +68,86 @@ async def request_id_middleware(request: Request, call_next):
 
 app.include_router(api_router, prefix=settings.API_V1_PREFIX)
 app.include_router(ws_router)
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=tags_metadata,
+    )
+    schema.setdefault("paths", {})
+    schema["paths"]["/ws/models/tasks/{task_id}"] = {
+        "get": {
+            "tags": ["models"],
+            "summary": "WebSocket 训练进度（浏览器升级）",
+            "description": (
+                "冻结路径。连接：`ws(s)://{host}/ws/models/tasks/{task_id}?token=<JWT>` "
+                "或 `?ticket=`（`POST /api/v1/auth/ws-ticket`）。"
+                "消息：`{type:progress,status,progress:{epoch,total_epochs,train_loss,val_loss,elapsed_s,eta_s},coef_summary?}`。"
+                "兼容旧路径 `/api/v1/models/tasks/{task_id}/ws`。"
+            ),
+            "parameters": [
+                {
+                    "name": "task_id",
+                    "in": "path",
+                    "required": True,
+                    "schema": {"type": "string", "format": "uuid"},
+                },
+                {
+                    "name": "token",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string"},
+                    "description": "JWT access token（浏览器 WebSocket 无法自定义 Header）",
+                },
+                {
+                    "name": "ticket",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string"},
+                },
+            ],
+            "responses": {"101": {"description": "Switching Protocols"}},
+        }
+    }
+    login = schema["paths"].get("/api/v1/auth/login", {}).get("post", {})
+    login["requestBody"] = {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["username", "password"],
+                    "properties": {
+                        "username": {"type": "string", "description": "邮箱或用户名"},
+                        "password": {"type": "string"},
+                    },
+                    "example": {"username": "demo@example.com", "password": "secret12"},
+                }
+            },
+            "application/x-www-form-urlencoded": {
+                "schema": {
+                    "type": "object",
+                    "required": ["username", "password"],
+                    "properties": {
+                        "username": {"type": "string"},
+                        "password": {"type": "string"},
+                    },
+                }
+            },
+        },
+    }
+    schema["paths"]["/api/v1/auth/login"]["post"] = login
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
 
 
 @app.get("/", tags=["health"])
