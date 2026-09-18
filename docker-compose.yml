@@ -1,0 +1,103 @@
+# GNNWR 平台后端一键编排
+# 默认：postgis + redis + minio + api + worker-cpu + worker-gpu
+# 可选：docker compose --profile extras up  以启动 GeoServer
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gnnwr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gnnwr_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-gnnwr_platform}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gnnwr}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes: [minio_data:/data]
+    ports: ["9000:9000", "9001:9001"]
+
+  geoserver:
+    profiles: ["extras"]
+    image: docker.osgeo.org/geoserver:2.25.2
+    environment:
+      GEOSERVER_ADMIN_USER: ${GEOSERVER_USER:-admin}
+      GEOSERVER_ADMIN_PASSWORD: ${GEOSERVER_PASSWORD:-geoserver}
+    volumes: [geoserver_data:/opt/geoserver_data]
+    ports: ["8080:8080"]
+
+  api:
+    build: .
+    environment: &app_env
+      POSTGRES_HOST: postgis
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-gnnwr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gnnwr_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-gnnwr_platform}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: gnnwr
+      LOCAL_STORAGE_DIR: /data/gnnwr-storage
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      SECRET_KEY: ${SECRET_KEY:-CHANGE_ME_IN_PRODUCTION_please_use_openssl_rand_hex_32}
+      ENGINE_BACKEND: ${ENGINE_BACKEND:-gnnwr_lite}
+      SURFACE_TILE_CRS: GCJ02
+      VECTOR_OUTPUT_CRS: WGS84
+      DEBUG: ${DEBUG:-false}
+      WS_REQUIRE_AUTH: ${WS_REQUIRE_AUTH:-true}
+      ALLOW_INLINE_JOBS: ${ALLOW_INLINE_JOBS:-false}
+      TILE_TOKEN_EXPIRE_MINUTES: ${TILE_TOKEN_EXPIRE_MINUTES:-60}
+    volumes:
+      - gnnwr_storage:/data/gnnwr-storage
+    depends_on:
+      postgis: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    ports: ["8000:8000"]
+
+  worker-cpu:
+    build: .
+    command: celery -A app.tasks.celery_app.celery_app worker -Q cpu_queue -c 4 --loglevel=info
+    environment: *app_env
+    volumes:
+      - gnnwr_storage:/data/gnnwr-storage
+    depends_on:
+      postgis: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  worker-gpu:
+    build: .
+    command: celery -A app.tasks.celery_app.celery_app worker -Q gpu_queue -c 1 --loglevel=info
+    environment: *app_env
+    volumes:
+      - gnnwr_storage:/data/gnnwr-storage
+    depends_on:
+      postgis: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+volumes:
+  pg_data:
+  minio_data:
+  geoserver_data:
+  gnnwr_storage:
