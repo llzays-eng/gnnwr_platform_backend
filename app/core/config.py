@@ -16,7 +16,7 @@ class Settings(BaseSettings):
 
     APP_NAME: str = "GNNWR Platform API"
     API_V1_PREFIX: str = "/api/v1"
-    DEBUG: bool = True
+    DEBUG: bool = False
     PUBLIC_BASE_URL: str = "http://localhost:8000"
 
     SECRET_KEY: str = "CHANGE_ME_IN_PRODUCTION_please_use_openssl_rand_hex_32"
@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
     REFRESH_TOKEN_EXPIRE_DAYS: int = 14
     WS_REQUIRE_AUTH: bool = True
+    TILE_TOKEN_EXPIRE_MINUTES: int = 60
+    # 仅开发：Celery broker 不可用时在 API 进程内跑预处理/训练。生产必须 false。
+    ALLOW_INLINE_JOBS: bool = False
 
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432

@@ -190,8 +190,11 @@ def run_train(task_id: str, csv_key: str, celery_id: str | None = None) -> dict:
                         error_code="TASK_CANCELLED", error_retryable=False,
                         finished_at=datetime.now(timezone.utc))
         append_log(task_id, "任务已取消", "warn")
-        publish_progress(task_id, build_status_message(task_id, "FAILED", "任务已取消"))
-        return {"task_id": task_id, "status": "CANCELLED"}
+        publish_progress(
+            task_id,
+            build_status_message(task_id, "FAILED", "任务已取消", code="TASK_CANCELLED"),
+        )
+        return {"task_id": task_id, "status": "FAILED", "error_code": "TASK_CANCELLED"}
 
     except Exception as exc:  # noqa: BLE001
         db.rollback()

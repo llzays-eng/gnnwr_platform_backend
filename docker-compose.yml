@@ -67,6 +67,8 @@ services:
       VECTOR_OUTPUT_CRS: WGS84
       DEBUG: ${DEBUG:-false}
       WS_REQUIRE_AUTH: ${WS_REQUIRE_AUTH:-true}
+      ALLOW_INLINE_JOBS: ${ALLOW_INLINE_JOBS:-false}
+      TILE_TOKEN_EXPIRE_MINUTES: ${TILE_TOKEN_EXPIRE_MINUTES:-60}
     volumes:
       - gnnwr_storage:/data/gnnwr-storage
     depends_on:

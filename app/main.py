@@ -9,16 +9,19 @@ from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 
 from app.api.v1 import api_router
 from app.core.config import settings
+from app.services.jobs import BrokerUnavailable
 from app.ws.progress import router as ws_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.core.startup import assert_secure_startup
+    assert_secure_startup()
     try:
         from app.core.database import init_db
         init_db()
@@ -70,6 +73,11 @@ app.include_router(api_router, prefix=settings.API_V1_PREFIX)
 app.include_router(ws_router)
 
 
+@app.exception_handler(BrokerUnavailable)
+async def broker_unavailable_handler(_request: Request, exc: BrokerUnavailable):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -87,8 +95,9 @@ def custom_openapi():
             "summary": "WebSocket 训练进度（浏览器升级）",
             "description": (
                 "冻结路径。连接：`ws(s)://{host}/ws/models/tasks/{task_id}?token=<JWT>` "
-                "或 `?ticket=`（`POST /api/v1/auth/ws-ticket`）。"
+                "或一次性 `?ticket=`（`POST /api/v1/auth/ws-ticket`，连接成功即 GETDEL 失效）。"
                 "消息：`{type:progress,status,progress:{epoch,total_epochs,train_loss,val_loss,elapsed_s,eta_s},coef_summary?}`。"
+                "status 仅为 PENDING|RUNNING|SUCCESS|FAILED（取消为 FAILED + TASK_CANCELLED）。"
                 "兼容旧路径 `/api/v1/models/tasks/{task_id}/ws`。"
             ),
             "parameters": [

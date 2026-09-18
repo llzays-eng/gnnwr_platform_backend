@@ -125,11 +125,19 @@ def build_progress_message(
     return msg
 
 
-def build_status_message(task_id: str, status: str, error: str | None = None) -> dict:
+def build_status_message(task_id: str, status: str, error: str | None = None,
+                         code: str | None = None) -> dict:
+    from app.services.status import public_task_status
+    status = public_task_status(status)
     msg = {"type": "status", "task_id": task_id, "status": status}
     if error:
+        err_code = code or (
+            "TASK_CANCELLED" if "取消" in error else "TRAIN_FAILED"
+        )
         msg["error"] = error
         msg["type"] = "error"
-        msg["code"] = "TRAIN_FAILED"
+        msg["code"] = err_code
         msg["message"] = error
+        if err_code == "TASK_CANCELLED":
+            msg["retryable"] = False
     return msg

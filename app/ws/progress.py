@@ -15,21 +15,20 @@ from app.core.redis_client import is_jti_denied
 from app.core.security import decode_token
 from app.models.model_task import ModelTask
 from app.models.project import Project
+from app.services.status import public_task_status
+from app.services.tickets import consume_ws_ticket
 from app.tasks.progress import build_progress_message, build_status_message, channel
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
 
-async def _resolve_user_id(websocket: WebSocket) -> str | None:
+async def _resolve_user_id(websocket: WebSocket, task_id: str) -> str | None:
     token = websocket.query_params.get("token")
     ticket = websocket.query_params.get("ticket")
     if ticket:
         try:
-            import redis
-            r = redis.from_url(settings.redis_uri, decode_responses=True)
-            uid = r.get(f"ws:ticket:{ticket}")
-            r.close()
+            uid = consume_ws_ticket(ticket, task_id=task_id)
             if uid:
                 return uid
         except Exception:
@@ -61,7 +60,7 @@ def _can_access(task_id: str, user_id: str | None) -> ModelTask | None:
 
 @router.websocket("/ws/models/tasks/{task_id}")
 async def ws_progress(websocket: WebSocket, task_id: str):
-    user_id = await _resolve_user_id(websocket)
+    user_id = await _resolve_user_id(websocket, task_id)
     if settings.ws_must_auth and not user_id:
         await websocket.close(code=4401, reason="unauthorized")
         return
@@ -82,7 +81,7 @@ async def ws_progress(websocket: WebSocket, task_id: str):
             detail = t.progress_detail or {}
             hp = t.hyperparams or {}
             total = int(detail.get("total_epochs") or hp.get("max_epochs") or hp.get("max_epoch") or 0)
-            status = "FAILED" if t.status == "CANCELLED" else t.status
+            status = public_task_status(t.status)
             if t.status == "RUNNING" or detail:
                 await websocket.send_json(build_progress_message(
                     task_id, status,
@@ -90,7 +89,9 @@ async def ws_progress(websocket: WebSocket, task_id: str):
                     detail.get("train_loss"), detail.get("val_loss"),
                     float(detail.get("elapsed_s") or 0), detail.get("eta_s"),
                 ))
-            await websocket.send_json(build_status_message(task_id, status, t.error))
+            await websocket.send_json(build_status_message(
+                task_id, status, t.error, code=t.error_code,
+            ))
         finally:
             db.close()
 

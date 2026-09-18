@@ -1,7 +1,6 @@
 """认证：register / login（JSON + OAuth2 表单）/ me / refresh / logout / ws-ticket。"""
 from __future__ import annotations
 
-import secrets
 from datetime import datetime, timezone
 
 import jwt
@@ -9,10 +8,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import get_current_user
-from app.core.redis_client import blacklist_jti, get_sync_redis, redis_available
+from app.core.redis_client import blacklist_jti, redis_available
 from app.core.security import (
     Role, create_access_token, create_refresh_token, decode_token,
     hash_password, verify_password,
@@ -20,6 +18,7 @@ from app.core.security import (
 from app.models.user import User
 from app.schemas.auth import LoginResponse, RefreshRequest, UserCreate, UserProfile, WsTicketOut
 from app.services.serialize import login_response, user_profile
+from app.services.tickets import TICKET_TTL_S, issue_ws_ticket
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -110,9 +109,9 @@ def logout(request: Request, user: User = Depends(get_current_user)):
 
 
 @router.post("/ws-ticket", response_model=WsTicketOut)
-def ws_ticket(user: User = Depends(get_current_user)):
+def ws_ticket(task_id: str | None = None, user: User = Depends(get_current_user)):
+    """一次性短票。可选绑定 task_id；连接成功后即失效（GETDEL）。"""
     if not redis_available():
         raise HTTPException(status_code=503, detail="Redis 不可用，请改用 WebSocket ?token=")
-    ticket = secrets.token_urlsafe(24)
-    get_sync_redis().setex(f"ws:ticket:{ticket}", 120, user.id)
-    return WsTicketOut(ticket=ticket, expires_in=120)
+    ticket = issue_ws_ticket(user.id, task_id=task_id)
+    return WsTicketOut(ticket=ticket, expires_in=TICKET_TTL_S)

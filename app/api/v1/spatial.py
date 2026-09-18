@@ -10,10 +10,12 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.model_task import ModelTask
+from app.models.project import Dataset, Project
 from app.models.user import User
 from app.schemas.spatial import SpatialFeatureOut, SurfaceLayerInfo, TilesResponse
-from app.services.crs_transform import gcj02_to_wgs84, wgs84_to_gcj02
+from app.services.crs_transform import gcj02_to_wgs84, normalize_crs, wgs84_to_gcj02
 from app.services.geoserver import geoserver
+from app.services.signed_url import append_query, create_tile_token, verify_tile_token
 from app.services.surface import (
     field_bbox_gcj02, legend_png, load_points_cached, render_bbox_png, render_xyz,
 )
@@ -29,10 +31,62 @@ def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
         raise HTTPException(status_code=400, detail="bbox 格式应为 minLon,minLat,maxLon,maxLat")
 
 
+def _owns_dataset(db: Session, dataset_id: str, user: User) -> Dataset:
+    ds = db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    proj = db.get(Project, ds.project_id)
+    if not proj or proj.user_id != user.id:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    return ds
+
+
+def _owns_task(db: Session, task_id: str, user: User) -> ModelTask:
+    task = db.get(ModelTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    proj = db.get(Project, task.project_id)
+    if not proj or proj.user_id != user.id:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
+
+
+def _bbox_to_wgs84(min_lon: float, min_lat: float, max_lon: float, max_lat: float,
+                   bbox_crs: str) -> tuple[float, float, float, float]:
+    """bbox_crs=WGS84（默认，对齐前端 BBox）时原样查询；GCJ02 时四角反解再取包络。"""
+    crs = normalize_crs(bbox_crs)
+    if crs != "GCJ02":
+        return min_lon, min_lat, max_lon, max_lat
+    corners = [
+        gcj02_to_wgs84(min_lon, min_lat),
+        gcj02_to_wgs84(min_lon, max_lat),
+        gcj02_to_wgs84(max_lon, min_lat),
+        gcj02_to_wgs84(max_lon, max_lat),
+    ]
+    xs = [c[0] for c in corners]
+    ys = [c[1] for c in corners]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _wms_crs_element() -> str:
+    """与 SURFACE_TILE_CRS / 响应 tile_crs 一致。GCJ02 不是 CRS:84。"""
+    c = (settings.SURFACE_TILE_CRS or "GCJ02").upper().replace("-", "")
+    if c == "WGS84":
+        return "CRS:84"
+    if c == "GCJ02":
+        return "GCJ02"
+    return c
+
+
+def _public() -> str:
+    return settings.PUBLIC_BASE_URL.rstrip("/")
+
+
 @router.get("/tiles", response_model=TilesResponse)
 def tiles(
     dataset_id: str,
     bbox: str = Query(..., description="minLon,minLat,maxLon,maxLat"),
+    bbox_crs: str = Query("WGS84", description="bbox 坐标系：WGS84（默认，对齐前端）或 GCJ02"),
     time_from: str | None = None,
     time_to: str | None = None,
     time_start: float | None = None,
@@ -47,17 +101,14 @@ def tiles(
     """
     库内几何为 WGS84。默认出库 WGS84，独立前端 toRenderCRS() 负责纠偏到高德。
     传 output_crs=GCJ02 时服务端纠偏（须阅读响应 crs 字段，避免二次转换）。
+    bbox 默认按 WGS84 解释；仅 bbox_crs=GCJ02 时转换四角。
     """
+    _owns_dataset(db, dataset_id, user)
     min_lon, min_lat, max_lon, max_lat = _parse_bbox(bbox)
+    qmin_lon, qmin_lat, qmax_lon, qmax_lat = _bbox_to_wgs84(
+        min_lon, min_lat, max_lon, max_lat, bbox_crs,
+    )
     out_crs = (output_crs or settings.VECTOR_OUTPUT_CRS).upper().replace("-", "")
-    # 查询用 WGS84 envelope；若客户端 bbox 来自高德，可先反解四个角以覆盖偏移
-    qminx, qminy = gcj02_to_wgs84(min_lon, min_lat)
-    qmaxx, qmaxy = gcj02_to_wgs84(max_lon, max_lat)
-    # 取并集，兼容 WGS84 / GCJ02 两种 bbox
-    qmin_lon = min(min_lon, qminx) - 0.01
-    qmin_lat = min(min_lat, qminy) - 0.01
-    qmax_lon = max(max_lon, qmaxx) + 0.01
-    qmax_lat = max(max_lat, qmaxy) + 0.01
 
     offset = int(cursor or 0)
     sql = """
@@ -110,28 +161,18 @@ def tiles(
     )
 
 
-def _public() -> str:
-    return settings.PUBLIC_BASE_URL.rstrip("/")
-
-
 @router.get("/surface/{task_id}", response_model=SurfaceLayerInfo)
 def surface(task_id: str, db: Session = Depends(get_db),
             user: User = Depends(get_current_user)):
     """
-    栅格曲面。tile_crs 必填且如实：
-    本服务 XYZ/WMS 把瓦片经纬度按 GCJ-02 解释（路线 A），因此 tile_crs=GCJ02。
-    未接 GeoServer 也能出图。WMS TIME 暂不支持。
+    栅格曲面。tile_crs 必填且如实。
+    返回的 WMS/XYZ/legend URL 已带短时签名 query `sig`（地图 <img> 无法带 Authorization）。
+    UUID 本身不是授权凭据。
     """
-    task = db.get(ModelTask, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    from app.models.project import Project
-    proj = db.get(Project, task.project_id)
-    if not proj or proj.user_id != user.id:
-        raise HTTPException(status_code=404, detail="任务不存在")
-
+    _owns_task(db, task_id, user)
+    sig = create_tile_token(user.id, task_id)
     layer = f"{geoserver.ws}:surface_{task_id}"
-    base = f"{_public()}/api/v1/spatial/wms/{task_id}"
+    base = append_query(f"{_public()}/api/v1/spatial/wms/{task_id}", sig=sig)
     tile_crs = settings.SURFACE_TILE_CRS.upper().replace("-", "")
     if tile_crs not in ("GCJ02", "WGS84"):
         tile_crs = "GCJ02"
@@ -142,6 +183,12 @@ def surface(task_id: str, db: Session = Depends(get_db),
         bbox = [73.0, 18.0, 135.0, 54.0]
         times = []
     time_dim = [str(t) for t in times] if times else None
+    xyz = append_query(
+        f"{_public()}/api/v1/spatial/surface/{task_id}/xyz/{{z}}/{{x}}/{{y}}.png", sig=sig,
+    )
+    legend = append_query(
+        f"{_public()}/api/v1/spatial/surface/{task_id}/legend.png", sig=sig,
+    )
     return SurfaceLayerInfo(
         task_id=task_id,
         service="WMS",
@@ -150,18 +197,23 @@ def surface(task_id: str, db: Session = Depends(get_db),
         tile_crs=tile_crs,
         bbox=bbox,
         time_dimension=time_dim,
-        legend_url=f"{_public()}/api/v1/spatial/surface/{task_id}/legend.png",
-        xyz_url_template=f"{_public()}/api/v1/spatial/surface/{task_id}/xyz/{{z}}/{{x}}/{{y}}.png",
+        legend_url=legend,
+        xyz_url_template=xyz,
         wms_url=base,
         layer=layer,
         wms_time_supported=False,
-        note="瓦片经纬度按 tile_crs 解释。本服务默认 GCJ02，与高德底图对齐；未做 TIME 维。",
+        note=(
+            f"瓦片经纬度按 tile_crs={tile_crs} 解释。"
+            "XYZ/WMS/legend 必须带 query sig（短时 JWT，绑定 task_id+用户）。"
+            "WMS TIME 维未实现。"
+        ),
     )
 
 
 @router.get("/surface/{task_id}/xyz/{z}/{x}/{y}.png")
-def surface_xyz(task_id: str, z: int, x: int, y: int, db: Session = Depends(get_db)):
-    # 地图 <img>/WMS 无法带 Authorization；task_id 为 UUID。元数据接口仍需 JWT。
+def surface_xyz(task_id: str, z: int, x: int, y: int, sig: str | None = None,
+                db: Session = Depends(get_db)):
+    verify_tile_token(sig, task_id)
     if not db.get(ModelTask, task_id):
         raise HTTPException(status_code=404, detail="任务不存在")
     png = render_xyz(task_id, z, x, y)
@@ -169,7 +221,8 @@ def surface_xyz(task_id: str, z: int, x: int, y: int, db: Session = Depends(get_
 
 
 @router.get("/surface/{task_id}/legend.png")
-def surface_legend(task_id: str, db: Session = Depends(get_db)):
+def surface_legend(task_id: str, sig: str | None = None, db: Session = Depends(get_db)):
+    verify_tile_token(sig, task_id)
     if not db.get(ModelTask, task_id):
         raise HTTPException(status_code=404, detail="任务不存在")
     return Response(content=legend_png(task_id), media_type="image/png")
@@ -178,22 +231,30 @@ def surface_legend(task_id: str, db: Session = Depends(get_db)):
 @router.get("/wms/{task_id}")
 def wms_getmap(
     task_id: str,
+    sig: str | None = None,
     BBOX: str | None = None,
     WIDTH: int = 256,
     HEIGHT: int = 256,
     REQUEST: str = "GetMap",
     db: Session = Depends(get_db),
 ):
-    """简易 WMS GetMap。BBOX 按 tile_crs（默认 GCJ02）解释。"""
+    """简易 WMS。BBOX 按 tile_crs 解释。GetCapabilities 的 CRS 与 tile_crs 一致。"""
+    verify_tile_token(sig, task_id)
     task = db.get(ModelTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
+    tile_crs = (settings.SURFACE_TILE_CRS or "GCJ02").upper().replace("-", "")
     if REQUEST.lower() == "getcapabilities":
+        crs = _wms_crs_element()
         xml = f"""<?xml version="1.0"?>
-<WMS_Capabilities><Capability><Layer>
-  <Name>surface_{task_id}</Name>
-  <CRS>CRS:84</CRS>
-</Layer></Capability></WMS_Capabilities>"""
+<WMS_Capabilities>
+  <Service><Title>GNNWR surface</Title></Service>
+  <Capability><Layer>
+    <Name>surface_{task_id}</Name>
+    <CRS>{crs}</CRS>
+    <Abstract>tile_crs={tile_crs}. GCJ02 is not CRS:84/EPSG:4326.</Abstract>
+  </Layer></Capability>
+</WMS_Capabilities>"""
         return Response(content=xml, media_type="text/xml")
     if not BBOX:
         raise HTTPException(status_code=400, detail="GetMap 需要 BBOX")

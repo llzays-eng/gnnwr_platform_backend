@@ -20,9 +20,9 @@ from app.schemas.dataset import (
     PresignResponse, PreviewResponse,
 )
 from app.services import ingest
-from app.services.crs_transform import offshore_ratio, wgs84_to_gcj02
+from app.services.crs_transform import normalize_crs, offshore_ratio, wgs84_to_gcj02
 from app.services.field_mapper import infer_field_schema, suggest_mapping
-from app.services.jobs import enqueue
+from app.services.jobs import BrokerUnavailable, enqueue
 from app.services.serialize import dataset_out
 from app.services.storage import storage
 from app.tasks.ingest_task import preprocess_task, run_preprocess
@@ -248,8 +248,8 @@ def preview(dataset_id: str, rows: int = Query(20, alias="rows"), n: int | None 
                 continue
             spatial_sample.append([lon, lat])
             if i % step == 0:
-                glon, glat = wgs84_to_gcj02(lon, lat) if src.upper() in ("WGS84", "CGCS2000") else (lon, lat)
-                if src.upper() in ("GCJ02", "GCJ-02"):
+                # preview `points` are GCJ-02 for Amap; WGS84/CGCS2000 are shifted once.
+                if normalize_crs(src) == "GCJ02":
                     glon, glat = lon, lat
                 else:
                     glon, glat = wgs84_to_gcj02(lon, lat)
@@ -297,7 +297,15 @@ def preprocess(dataset_id: str, payload: PreprocessRequest,
     ds.mapping = mapping
     db.commit()
 
-    celery_id, inline = enqueue(preprocess_task.delay, dataset_id, mapping, fallback=run_preprocess)
+    try:
+        celery_id, inline = enqueue(
+            preprocess_task.delay, dataset_id, mapping, fallback=run_preprocess,
+        )
+    except BrokerUnavailable as exc:
+        ds.status = "uploaded"
+        ds.status_detail = {"error": str(exc), "code": "QUEUE_UNAVAILABLE"}
+        db.commit()
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     db.refresh(ds)
     if inline:
         db.refresh(ds)

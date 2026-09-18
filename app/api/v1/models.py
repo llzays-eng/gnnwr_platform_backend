@@ -18,8 +18,9 @@ from app.schemas.model import (
     BaselineComparisonOut, BaselineEntry, CancelOut, CoefficientPage, CoefficientPoint,
     GeoJsonPoint, ModelResultOut, ModelTaskOut, TaskLogsOut, TrainRequest,
 )
-from app.services.jobs import enqueue
+from app.services.jobs import BrokerUnavailable, enqueue
 from app.services.serialize import result_out, task_out
+from app.services.status import public_task_status
 from app.services.stats import best_by_metric
 from app.services.storage import storage
 from app.tasks.progress import mark_cancelled, read_logs
@@ -70,8 +71,15 @@ def train(req: TrainRequest, db: Session = Depends(get_db),
     db.commit()
     db.refresh(task)
 
-    celery_id, _inline = enqueue(train_task.delay, task.id, csv_key,
-                                 fallback=lambda tid, key: run_train(tid, key))
+    try:
+        celery_id, _inline = enqueue(
+            train_task.delay, task.id, csv_key,
+            fallback=lambda tid, key: run_train(tid, key),
+        )
+    except BrokerUnavailable as exc:
+        db.delete(task)
+        db.commit()
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if celery_id:
         task.celery_task_id = celery_id
         db.commit()
@@ -215,7 +223,9 @@ def coefficients(
 def cancel(task_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     task = _get_task(db, task_id, user)
     if task.status in ("SUCCESS", "FAILED", "CANCELLED"):
-        return CancelOut(task_id=task.id, status=task.status, revoked=False)
+        return CancelOut(
+            task_id=task.id, status=public_task_status(task.status), revoked=False,
+        )
     mark_cancelled(task.id)
     revoked = False
     if task.celery_task_id:

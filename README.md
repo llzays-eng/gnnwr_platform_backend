@@ -13,10 +13,11 @@ Product flow: **upload → preprocess → async train → WebSocket progress →
 | REST prefix | `/api/v1` |
 | Login | `POST /api/v1/auth/login` — **JSON** `{username, password}` *or* OAuth2 password form (`username` = email or username) |
 | **WebSocket path** | **`/ws/models/tasks/{task_id}`** (legacy alias: `/api/v1/models/tasks/{task_id}/ws`) |
-| WS auth | Query **`?token=`** (JWT access token) and/or **`?ticket=`** from `POST /api/v1/auth/ws-ticket`. Unauthenticated connections are **rejected when not in DEBUG** (`WS_REQUIRE_AUTH=true`). Send text `ping` → `{type: pong}` heartbeat. |
-| WS payload | `{ "type": "progress", "task_id", "status", "progress": { epoch, total_epochs, train_loss, val_loss, elapsed_s, eta_s }, "coef_summary"? }` plus `{type: status}` / `{type: log}` / `{type: error}` / `{type: pong}` |
-| **`tile_crs`** | `GET /api/v1/spatial/surface/{task_id}` **always includes `tile_crs`**. Default **`GCJ02`**: this service’s XYZ/WMS treats tile lon/lat as GCJ-02 (route A — truthful, matches Amap). Not a GeoServer-only stub. **WMS `TIME` is not supported** (`wms_time_supported: false`; `time_dimension` may still list GTNNWR time keys for the vector layer). |
-| Vector tiles | `GET /api/v1/spatial/tiles` stores WGS84; **default output `crs: WGS84`** so the frontend `toRenderCRS()` does not double-shift. Pass `output_crs=GCJ02` if the client will *not* transform. |
+| WS auth | Query **`?token=`** (JWT access token) and/or **`?ticket=`** from `POST /api/v1/auth/ws-ticket` (optional `task_id` bind). Tickets are **one-shot** (Redis `GETDEL` on connect). Unauthenticated connections are **rejected when not in DEBUG** (`WS_REQUIRE_AUTH=true`). Send text `ping` → `{type: pong}` heartbeat. |
+| WS payload | `{ "type": "progress", "task_id", "status", "progress": { epoch, total_epochs, train_loss, val_loss, elapsed_s, eta_s }, "coef_summary"? }` plus `{type: status}` / `{type: log}` / `{type: error}` / `{type: pong}`. `status` is only `PENDING\|RUNNING\|SUCCESS\|FAILED` (cancel is **FAILED** + `error.code=TASK_CANCELLED`). |
+| **`tile_crs`** | `GET /api/v1/spatial/surface/{task_id}` **always includes `tile_crs`**. Default **`GCJ02`**: this service’s XYZ/WMS treats tile lon/lat as GCJ-02 (route A — truthful, matches Amap). WMS GetCapabilities CRS matches `SURFACE_TILE_CRS` (GCJ02 is **not** advertised as `CRS:84`). **WMS `TIME` is not supported** (`wms_time_supported: false`; `time_dimension` may still list GTNNWR time keys for the vector layer). |
+| Surface img/WMS auth | Map `<img>` and WMS cannot send `Authorization`. JWT surface metadata returns XYZ / WMS / legend URLs **already including** a short-lived query `sig` (`typ=tile`, bound to user + `task_id`, TTL `TILE_TOKEN_EXPIRE_MINUTES`). Missing / invalid / expired / wrong-task signatures are **401**. A task UUID in the path is **not** authorization. |
+| Vector tiles | `GET /api/v1/spatial/tiles` requires owning the dataset’s project (else **404**). Store is WGS84; **default output `crs: WGS84`**. `bbox_crs` defaults to **WGS84** (frontend `BBox`); only `bbox_crs=GCJ02` transforms corners. Pass `output_crs=GCJ02` if the client will *not* transform. |
 | Task list | **`GET /api/v1/models/tasks?project_id=`** (Paginated) — this was missing in the monorepo |
 | Coefficients | Full dump by default (`limit=0`); optional `bbox`, `cursor`, `limit`, `vars` |
 
@@ -69,9 +70,17 @@ uvicorn app.main:app --reload --port 8000
 celery -A app.tasks.celery_app.celery_app worker -Q cpu_queue,gpu_queue -l info
 ```
 
-If Celery/Redis is down, preprocess and train **fall back to in-process execution** so `/docs` experiments still work.
+If Celery/Redis is down, train/preprocess return **503** unless you explicitly set `ALLOW_INLINE_JOBS=true` (dev only). The API process does **not** silently run training inline.
 
 OpenAPI: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+### Auth threat model (tiles / WS)
+
+- **Knowing a UUID is not auth.** `dataset_id` / `task_id` in the path only identify the resource; ownership is checked via JWT, or via a signed tile `sig`, or a one-shot WS ticket.
+- **Browser map tiles** (`<img>`, WMS `GetMap`) cannot attach `Authorization`. Those three routes (`/spatial/surface/{id}/xyz/...png`, `/legend.png`, `/spatial/wms/{id}`) require query `sig`. The JWT `GET /spatial/surface/{id}` mints that signature so the frontend can paste URLs into Amap.
+- Tile `sig` is a JWT (`typ=tile`) bound to `sub` (user) + `tid` (task), reusable until TTL (default 60 minutes) so the map can fetch many tiles. It is **not** an access token and is rejected on other routes.
+- **WS tickets** are one-shot: `POST /auth/ws-ticket` stores `{user_id, task_id?}` in Redis; the first successful `?ticket=` consume (`GETDEL`) deletes it. Replay is denied. Prefer `?token=` for reconnects.
+- **`SECRET_KEY`**: default `DEBUG=false`. If `SECRET_KEY` is still the `CHANGE_ME…` placeholder, the process **refuses to start** when `DEBUG` is false; DEBUG-only logs a loud warning.
 
 ### Tests
 
@@ -89,7 +98,7 @@ python -m engine.test_engine # 完整引擎回归（更慢，含精度断言）
 | GET | `/api/v1/auth/me` | JWT |
 | POST | `/api/v1/auth/refresh` | body `{refresh_token}` |
 | POST | `/api/v1/auth/logout` | access `jti` blacklist (Redis) |
-| POST | `/api/v1/auth/ws-ticket` | 120s ticket for WS |
+| POST | `/api/v1/auth/ws-ticket` | 120s **one-shot** ticket (`task_id` optional bind) |
 | POST/GET | `/api/v1/projects` | create; list Paginated |
 | GET/DELETE | `/api/v1/projects/{id}` | |
 | POST | `/api/v1/datasets/upload` | multipart `project_id`,`file`,`source_crs?` · 200MB |
@@ -98,13 +107,16 @@ python -m engine.test_engine # 完整引擎回归（更慢，含精度断言）
 | GET | `/api/v1/datasets?project_id=` | Paginated, `project_id` required |
 | GET | `/api/v1/datasets/{id}/preview` | `spatial_sample` + GCJ-02 `points` + `mapping_suggestion` |
 | POST | `/api/v1/datasets/{id}/preprocess` | 202, Celery `cpu_queue`; status `uploaded→cleaning→cleaned→ingested` |
-| POST | `/api/v1/models/train` | 202 |
+| POST | `/api/v1/models/train` | 202; **503** if broker down unless `ALLOW_INLINE_JOBS` |
 | GET | `/api/v1/models/tasks?project_id=` | **P0 list** |
 | GET | `/api/v1/models/tasks/{id}/status\|result\|compare\|coefficients` | |
-| POST | `/api/v1/models/tasks/{id}/cancel` | mark + best-effort revoke |
+| POST | `/api/v1/models/tasks/{id}/cancel` | public status **FAILED**, `error.code=TASK_CANCELLED`, `retryable=false` |
 | GET | `/api/v1/models/tasks/{id}/logs?since=` | |
-| GET | `/api/v1/spatial/tiles` | `bbox` required; `fields`, `cursor`, time filters |
-| GET | `/api/v1/spatial/surface/{id}` | **`tile_crs` required in body** |
+| GET | `/api/v1/spatial/tiles` | owner check; `bbox`; `bbox_crs=WGS84` default; `fields`, `cursor`, time filters |
+| GET | `/api/v1/spatial/surface/{id}` | JWT; **`tile_crs`**; URLs include `sig` |
+| GET | `/api/v1/spatial/surface/{id}/xyz/{z}/{x}/{y}.png` | **`sig` required** |
+| GET | `/api/v1/spatial/surface/{id}/legend.png` | **`sig` required** |
+| GET | `/api/v1/spatial/wms/{id}` | **`sig` required**; GetCapabilities CRS = `SURFACE_TILE_CRS` |
 | GET | `/api/v1/reports/{id}/export` | sync PDF or HTML |
 
 Business routes require `Authorization: Bearer <access_token>`.
@@ -123,4 +135,4 @@ Still not in this baseline:
 
 ## Environment
 
-See `.env.example`. Important: `SECRET_KEY`, `SURFACE_TILE_CRS=GCJ02`, `VECTOR_OUTPUT_CRS=WGS84`, `ENGINE_BACKEND=gnnwr_lite`, `WS_REQUIRE_AUTH`.
+See `.env.example`. Important: `SECRET_KEY` (must not be the placeholder when `DEBUG=false`), `DEBUG=false` default, `ALLOW_INLINE_JOBS=false`, `TILE_TOKEN_EXPIRE_MINUTES`, `SURFACE_TILE_CRS=GCJ02`, `VECTOR_OUTPUT_CRS=WGS84`, `ENGINE_BACKEND=gnnwr_lite`, `WS_REQUIRE_AUTH`.

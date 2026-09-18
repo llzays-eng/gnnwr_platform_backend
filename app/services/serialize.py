@@ -1,6 +1,7 @@
 """ORM → 前端冻结/待冻结契约。"""
 from __future__ import annotations
 
+from app.core.config import settings
 from app.models.model_task import ModelTask
 from app.models.project import Dataset, Project
 from app.models.user import User
@@ -9,7 +10,7 @@ from app.schemas.common import iso
 from app.schemas.dataset import DatasetOut
 from app.schemas.model import ModelResultOut, ModelTaskOut, TaskError, TaskProgress
 from app.schemas.project import ProjectOut
-from app.core.config import settings
+from app.services.status import public_task_status
 
 
 def user_profile(user: User) -> UserProfile:
@@ -92,18 +93,22 @@ def task_out(task: ModelTask) -> ModelTaskOut:
             elapsed_s=float(detail.get("elapsed_s") or 0),
             eta_s=detail.get("eta_s"),
         )
+    status = public_task_status(task.status)
+    cancelled = (
+        task.status == "CANCELLED"
+        or task.error_code == "TASK_CANCELLED"
+        or (task.error is not None and "取消" in task.error)
+    )
     err = None
-    if task.error:
+    if cancelled:
+        err = TaskError(code="TASK_CANCELLED", message=task.error or "任务已取消", retryable=False)
+        status = "FAILED"
+    elif task.error:
         err = TaskError(
-            code=task.error_code or ("TASK_CANCELLED" if "取消" in task.error else "TRAIN_FAILED"),
+            code=task.error_code or "TRAIN_FAILED",
             message=task.error,
             retryable=bool(task.error_retryable) if task.error_retryable is not None else False,
         )
-    status = task.status
-    # 前端状态机无 CANCELLED，映射为 FAILED + error.code
-    if status == "CANCELLED":
-        status = "FAILED"
-        err = err or TaskError(code="TASK_CANCELLED", message="任务已取消", retryable=False)
     return ModelTaskOut(
         id=task.id,
         task_id=task.id,
